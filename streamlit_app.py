@@ -16,6 +16,8 @@ st.title("📊 Dashboard Executivo de Treinamentos")
 # =====================================================
 # Funções utilitárias
 # =====================================================
+
+
 def normalizar_colunas(df):
     df.columns = (
         df.columns
@@ -89,7 +91,8 @@ if uploaded_files:
     opcoes.extend([("Upload", file.name) for file in uploaded_files])
 
 if not opcoes:
-    st.warning("Nenhum arquivo disponível. Faça upload ou adicione arquivos em input/")
+    st.warning(
+        "Nenhum arquivo disponível. Faça upload ou adicione arquivos em input/")
     st.stop()
 
 origem, arquivo_selecionado = st.sidebar.selectbox(
@@ -113,22 +116,35 @@ if df is None:
 df = normalizar_colunas(df)
 
 # =====================================================
-# Normalização dos dados
+# Normalização dos dados (ROBUSTA)
 # =====================================================
 df["email"] = normalizar_texto(df["email"])
+
+# Nome do funcionário
+if {"first_name", "last_name"}.issubset(df.columns):
+    df["nome_funcionario"] = formatar_nome(
+        df["first_name"] + " " + df["last_name"]
+    )
+else:
+    df["nome_funcionario"] = (
+        df["email"].str.split("@").str[0].str.replace(".", " ").str.title()
+    )
+
+# Gerente
 df["manager_name"] = formatar_nome(df["manager_name"])
-df["nome_do_funcionário"] = formatar_nome(df["nome_do_funcionário"])
+
+# Departamento
 df["department"] = formatar_nome(df["department"])
 
 # =====================================================
 # Regra de vínculo (case insensitive)
 # =====================================================
 df["tipo"] = df["email"].apply(
-    lambda x: "Terceiro" if x.startswith("extern") else "Interno"
+    lambda x: "Terceiro" if x.lower().startswith("extern") else "Interno"
 )
 
 # =====================================================
-# Regra de conclusão
+# Regra de conclusão (Training Status)
 # =====================================================
 df["concluido"] = (
     df["training_status"]
@@ -144,7 +160,7 @@ df["concluido"] = (
 # =====================================================
 funcionarios = (
     df.groupby(
-        ["email", "nome_do_funcionário", "manager_name", "department", "tipo"],
+        ["email", "nome_funcionario", "manager_name", "department", "tipo"],
         as_index=False
     )
     .agg(
@@ -162,7 +178,7 @@ funcionarios["status"] = funcionarios["percentual"].apply(
 )
 
 # =====================================================
-# Filtro global – Tipo
+# Filtros globais
 # =====================================================
 st.sidebar.header("🔎 Filtros")
 
@@ -189,8 +205,10 @@ for col, tipo in zip([col_i, col_t], ["Interno", "Terceiro"]):
     with col:
         st.subheader(tipo)
         st.metric("Funcionários", base["email"].nunique())
-        st.metric("Aprovados (%)", round((base["status"] == "Aprovado").mean() * 100, 1))
-        st.metric("Reprovados (%)", round((base["status"] == "Reprovado").mean() * 100, 1))
+        st.metric("Aprovados (%)", round(
+            (base["status"] == "Aprovado").mean() * 100, 1))
+        st.metric("Reprovados (%)", round(
+            (base["status"] == "Reprovado").mean() * 100, 1))
 
 # =====================================================
 # Visão por Gerente (Interno x Terceiro)
@@ -209,11 +227,11 @@ gerentes = (
 st.dataframe(gerentes, use_container_width=True)
 
 # =====================================================
-# Funcionários Não Aprovados + Filtro por Gerente
+# Funcionários Não Aprovados + Exportação
 # =====================================================
 st.header("❌ Funcionários Não Aprovados (< 80%)")
 
-lista_gerentes = sorted(funcionarios_filtro["manager_name"].dropna().unique())
+lista_gerentes = sorted(funcionarios_filtro["manager_name"].unique())
 
 gerentes_selecionados = st.multiselect(
     "Filtrar por gerente:",
@@ -229,7 +247,8 @@ reprovados = funcionarios_filtro[
 export_df = (
     reprovados[
         [
-            "nome_do_funcionário",
+            "nome_funcionario",
+            "email",
             "manager_name",
             "department",
             "tipo",
@@ -243,9 +262,6 @@ export_df = (
 
 st.dataframe(export_df, use_container_width=True)
 
-# =====================================================
-# Exportação CSV
-# =====================================================
 csv = export_df.to_csv(index=False, sep=";", encoding="utf-8-sig")
 
 st.download_button(
