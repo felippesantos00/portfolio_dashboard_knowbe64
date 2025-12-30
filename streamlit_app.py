@@ -18,12 +18,14 @@ st.title("📊 Dashboard Executivo de Treinamentos")
 # Funções utilitárias
 # =====================================================
 
-
 def cor_percentual(valor):
+    # Trata caso o valor chegue como string formatada
+    if isinstance(valor, str):
+        valor = float(valor.replace('%', ''))
     if valor >= 80:
-        return "background-color: green"
+        return "background-color: #d4edda; color: #155724" # Verde suave
     else:
-        return "background-color: red"
+        return "background-color: #f8d7da; color: #721c24" # Vermelho suave
 
 def normalizar_colunas(df):
     df.columns = (
@@ -35,14 +37,11 @@ def normalizar_colunas(df):
     )
     return df
 
-
 def normalizar_texto(col):
     return col.astype(str).str.strip().str.lower()
 
-
 def formatar_nome(col):
     return col.astype(str).str.strip().str.title()
-
 
 def carregar_arquivo_local(caminho):
     try:
@@ -54,7 +53,6 @@ def carregar_arquivo_local(caminho):
         st.error(f"Erro ao carregar {os.path.basename(caminho)}: {e}")
         return None
 
-
 def carregar_arquivo_upload(file):
     try:
         if file.name.endswith(".csv"):
@@ -64,7 +62,6 @@ def carregar_arquivo_upload(file):
     except Exception as e:
         st.error(f"Erro ao carregar {file.name}: {e}")
         return None
-
 
 # =====================================================
 # Menu lateral – Fonte de dados
@@ -80,15 +77,13 @@ uploaded_files = st.sidebar.file_uploader(
 arquivos_locais = glob.glob("input/*.csv") + glob.glob("input/*.xlsx")
 
 opcoes = []
-
 if arquivos_locais:
     opcoes.extend([("Local", arq) for arq in arquivos_locais])
 if uploaded_files:
     opcoes.extend([("Upload", file.name) for file in uploaded_files])
 
 if not opcoes:
-    st.warning(
-        "Nenhum arquivo disponível. Faça upload ou adicione arquivos em input/")
+    st.warning("Nenhum arquivo disponível. Faça upload ou adicione arquivos em input/")
     st.stop()
 
 origem, arquivo_selecionado = st.sidebar.selectbox(
@@ -98,7 +93,7 @@ origem, arquivo_selecionado = st.sidebar.selectbox(
 )
 
 # =====================================================
-# Leitura do arquivo
+# Leitura e Normalização Inicial
 # =====================================================
 if origem == "Local":
     df = carregar_arquivo_local(arquivo_selecionado)
@@ -109,35 +104,37 @@ else:
 if df is None:
     st.stop()
 
+# Normalização de nomes de colunas e tipos
 df = normalizar_colunas(df)
+df = df.convert_dtypes() # Importante para evitar erros de tipo no DuckDB
 
-# =====================================================
-# Normalização dos dados
-# =====================================================
+# Normalização de dados
 df["email"] = normalizar_texto(df["email"])
 
-# Nome do funcionário
 if {"first_name", "last_name"}.issubset(df.columns):
-    df["nome_funcionario"] = formatar_nome(
-        df["first_name"] + " " + df["last_name"])
+    df["nome_funcionario"] = formatar_nome(df["first_name"] + " " + df["last_name"])
 else:
-    df["nome_funcionario"] = df["email"].str.split(
-        "@").str[0].str.replace(".", " ").str.title()
+    df["nome_funcionario"] = df["email"].str.split("@").str[0].str.replace(".", " ").str.title()
 
-# Gerente
 df["manager_name"] = formatar_nome(df["manager_name"])
-
-# Departamento
 df["department"] = formatar_nome(df["department"])
 
 # =====================================================
-# Conexão DuckDB e registro da tabela
+# Conexão DuckDB com Tratamento de Erro Robusto
 # =====================================================
 con = duckdb.connect(database=':memory:')
-con.register('treinamentos', df)
+
+try:
+    # Força a análise de todas as linhas para evitar erros de inferência de esquema
+    con.execute("SET GLOBAL pandas_analyze_sample=0")
+    con.register('treinamentos', df)
+except Exception:
+    # Fallback usando PyArrow para máxima compatibilidade
+    import pyarrow as pa
+    con.register('treinamentos', pa.Table.from_pandas(df))
 
 # =====================================================
-# Consolidação por funcionário usando DuckDB
+# Processamento de Dados (SQL)
 # =====================================================
 funcionarios = con.execute("""
     SELECT 
@@ -152,46 +149,37 @@ funcionarios = con.execute("""
     GROUP BY email, nome_funcionario, manager_name, department
 """).df()
 
-funcionarios["percentual"] = (
-    funcionarios["concluidos"] / funcionarios["total_treinamentos"]) * 100
-funcionarios["status"] = funcionarios["percentual"].apply(
-    lambda x: "Aprovado" if x >= 80 else "Reprovado")
+funcionarios["percentual"] = (funcionarios["concluidos"] / funcionarios["total_treinamentos"]) * 100
+funcionarios["status"] = funcionarios["percentual"].apply(lambda x: "Aprovado" if x >= 80 else "Reprovado")
 
 # =====================================================
-# Filtros globais
+# Filtros e Dashboard
 # =====================================================
 st.sidebar.header("🔎 Filtros")
-
 tipo_selecionado = st.sidebar.multiselect(
     "Tipo de vínculo:",
     ["Interno", "Terceiro"],
     default=["Interno", "Terceiro"]
 )
 
-funcionarios_filtro = funcionarios[
-    funcionarios["tipo"].isin(tipo_selecionado)
-]
+funcionarios_filtro = funcionarios[funcionarios["tipo"].isin(tipo_selecionado)]
 
-# =====================================================
-# Visão Executiva – Internos x Terceiros
-# =====================================================
 st.header("📈 Visão Executiva – Internos x Terceiros")
-
 col_i, col_t = st.columns(2)
 
 for col, tipo in zip([col_i, col_t], ["Interno", "Terceiro"]):
     base = funcionarios_filtro[funcionarios_filtro["tipo"] == tipo]
-
     with col:
         st.subheader(tipo)
-        st.metric("Funcionários", base["email"].nunique())
-        st.metric("Aprovados (%)", round(
-            (base["status"] == "Aprovado").mean() * 100, 1))
-        st.metric("Reprovados (%)", round(
-            (base["status"] == "Reprovado").mean() * 100, 1))
+        if not base.empty:
+            st.metric("Funcionários", base["email"].nunique())
+            st.metric("Aprovados (%)", f"{round((base['status'] == 'Aprovado').mean() * 100, 1)}%")
+            st.metric("Reprovados (%)", f"{round((base['status'] == 'Reprovado').mean() * 100, 1)}%")
+        else:
+            st.write("Sem dados para este tipo.")
 
 # =====================================================
-# Visão por Gerente (Interno x Terceiro)
+# Resultado por Gerente
 # =====================================================
 st.header("👔 Resultado por Gerente")
 
@@ -218,41 +206,31 @@ gerentes = con.execute("""
         SUM(CASE WHEN tipo = 'Interno' AND aprovado = 0 THEN 1 ELSE 0 END) AS reprovado_interno,
         SUM(CASE WHEN tipo = 'Terceiro' AND aprovado = 1 THEN 1 ELSE 0 END) AS aprovado_externo,
         SUM(CASE WHEN tipo = 'Terceiro' AND aprovado = 0 THEN 1 ELSE 0 END) AS reprovado_externo,
-        ROUND(
-            100.0 * SUM(aprovado) / COUNT(*),
-            1
-        ) AS percentual_aprovados
+        ROUND(100.0 * SUM(aprovado) / COUNT(*), 1) AS percentual_aprovados
     FROM aprovacao
     GROUP BY manager_name
     ORDER BY manager_name
 """).df()
-# gerentes["percentual_aprovados"] = gerentes["percentual_aprovados"].astype(str) + "%"
 
 styled_gerentes = (
     gerentes.style
-    # Formata colunas numéricas
     .format({
         "aprovado_interno": "{:.0f}",
         "reprovado_interno": "{:.0f}",
         "aprovado_externo": "{:.0f}",
         "reprovado_externo": "{:.0f}",
-        "percentual_aprovados": "{:.2f}%"
+        "percentual_aprovados": "{:.1f}%"
     })
-    # Aplica cor condicional no percentual
     .applymap(cor_percentual, subset=["percentual_aprovados"])
 )
-
 st.dataframe(styled_gerentes, use_container_width=True)
 
-# st.dataframe(gerentes, use_container_width=True)
-
 # =====================================================
-# Funcionários Não Aprovados + Exportação
+# Funcionários Não Aprovados
 # =====================================================
 st.header("❌ Funcionários Não Aprovados (< 80%)")
 
 lista_gerentes = sorted(funcionarios_filtro["manager_name"].unique())
-
 gerentes_selecionados = st.multiselect(
     "Filtrar por gerente:",
     options=lista_gerentes,
@@ -260,47 +238,12 @@ gerentes_selecionados = st.multiselect(
 )
 
 reprovados = funcionarios_filtro[
-    (funcionarios_filtro["status"] == "Reprovado") &
+    (funcionarios_filtro["status"] == "Reprovado") & 
     (funcionarios_filtro["manager_name"].isin(gerentes_selecionados))
 ]
 
-export_df = (
-    reprovados[
-        [
-            "nome_funcionario",
-            "email",
-            "manager_name",
-            "department",
-            "tipo",
-            "total_treinamentos",
-            "concluidos",
-            "percentual"
-        ]
-    ]
-    .sort_values("percentual")
+st.dataframe(
+    reprovados[["nome_funcionario", "email", "manager_name", "department", "percentual"]]
+    .sort_values("percentual"),
+    use_container_width=True
 )
-
-st.dataframe(export_df, use_container_width=True)
-
-csv = export_df.to_csv(index=False, sep=";", encoding="utf-8-sig")
-
-st.download_button(
-    label="⬇️ Baixar CSV – Funcionários Não Aprovados",
-    data=csv,
-    file_name="funcionarios_nao_aprovados.csv",
-    mime="text/csv"
-)
-
-# =====================================================
-# Gráfico Executivo Consolidado
-# =====================================================
-st.header("📊 Gráfico Executivo Consolidado")
-
-grafico = (
-    funcionarios_filtro
-    .groupby(["tipo", "status"])
-    .size()
-    .unstack(fill_value=0)
-)
-
-st.bar_chart(grafico)
