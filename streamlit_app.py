@@ -16,12 +16,9 @@ st.title("📊 Dashboard Executivo de Treinamentos")
 # =====================================================
 # Funções utilitárias
 # =====================================================
-
-
 def normalizar_colunas(df):
     df.columns = (
-        df.columns
-        .str.strip()
+        df.columns.str.strip()
         .str.lower()
         .str.replace(" ", "_")
         .str.replace("?", "", regex=False)
@@ -40,12 +37,7 @@ def formatar_nome(col):
 def carregar_arquivo_local(caminho):
     try:
         if caminho.endswith(".csv"):
-            return pd.read_csv(
-                caminho,
-                sep=";",
-                encoding="utf-8",
-                on_bad_lines="skip"
-            )
+            return pd.read_csv(caminho, sep=";", encoding="utf-8", on_bad_lines="skip")
         elif caminho.endswith(".xlsx"):
             return pd.read_excel(caminho)
     except Exception as e:
@@ -56,12 +48,7 @@ def carregar_arquivo_local(caminho):
 def carregar_arquivo_upload(file):
     try:
         if file.name.endswith(".csv"):
-            return pd.read_csv(
-                file,
-                sep=";",
-                encoding="utf-8",
-                on_bad_lines="skip"
-            )
+            return pd.read_csv(file, sep=";", encoding="utf-8", on_bad_lines="skip")
         elif file.name.endswith(".xlsx"):
             return pd.read_excel(file)
     except Exception as e:
@@ -83,16 +70,13 @@ uploaded_files = st.sidebar.file_uploader(
 arquivos_locais = glob.glob("input/*.csv") + glob.glob("input/*.xlsx")
 
 opcoes = []
-
 if arquivos_locais:
     opcoes.extend([("Local", arq) for arq in arquivos_locais])
-
 if uploaded_files:
     opcoes.extend([("Upload", file.name) for file in uploaded_files])
 
 if not opcoes:
-    st.warning(
-        "Nenhum arquivo disponível. Faça upload ou adicione arquivos em input/")
+    st.warning("Nenhum arquivo disponível.")
     st.stop()
 
 origem, arquivo_selecionado = st.sidebar.selectbox(
@@ -116,36 +100,26 @@ if df is None:
 df = normalizar_colunas(df)
 
 # =====================================================
-# Normalização dos dados (ROBUSTA)
+# Normalização dos dados
 # =====================================================
 df["email"] = normalizar_texto(df["email"])
 
-# Nome do funcionário
 if {"first_name", "last_name"}.issubset(df.columns):
-    df["nome_funcionario"] = formatar_nome(
-        df["first_name"] + " " + df["last_name"]
-    )
+    df["nome_funcionario"] = formatar_nome(df["first_name"] + " " + df["last_name"])
 else:
     df["nome_funcionario"] = (
         df["email"].str.split("@").str[0].str.replace(".", " ").str.title()
     )
 
-# Gerente
 df["manager_name"] = formatar_nome(df["manager_name"])
-
-# Departamento
 df["department"] = formatar_nome(df["department"])
 
-# =====================================================
-# Regra de vínculo (case insensitive)
-# =====================================================
+# Tipo de vínculo
 df["tipo"] = df["email"].apply(
-    lambda x: "Terceiro" if x.lower().startswith("extern") else "Interno"
+    lambda x: "Externo" if x.startswith("extern") else "Interno"
 )
 
-# =====================================================
-# Regra de conclusão (Training Status)
-# =====================================================
+# Conclusão
 df["concluido"] = (
     df["training_status"]
     .astype(str)
@@ -156,7 +130,7 @@ df["concluido"] = (
 )
 
 # =====================================================
-# Consolidação por funcionário
+# Consolidação por FUNCIONÁRIO (regra dos 80%)
 # =====================================================
 funcionarios = (
     df.groupby(
@@ -170,22 +144,22 @@ funcionarios = (
 )
 
 funcionarios["percentual"] = (
-    funcionarios["concluidos"] / funcionarios["total_treinamentos"]
-) * 100
+    funcionarios["concluidos"] / funcionarios["total_treinamentos"] * 100
+).round(2)
 
 funcionarios["status"] = funcionarios["percentual"].apply(
     lambda x: "Aprovado" if x >= 80 else "Reprovado"
 )
 
 # =====================================================
-# Filtros globais
+# Filtros
 # =====================================================
 st.sidebar.header("🔎 Filtros")
 
 tipo_selecionado = st.sidebar.multiselect(
     "Tipo de vínculo:",
-    ["Interno", "Terceiro"],
-    default=["Interno", "Terceiro"]
+    ["Interno", "Externo"],
+    default=["Interno", "Externo"]
 )
 
 funcionarios_filtro = funcionarios[
@@ -193,41 +167,50 @@ funcionarios_filtro = funcionarios[
 ]
 
 # =====================================================
-# Visão Executiva – Internos x Terceiros
-# =====================================================
-st.header("📈 Visão Executiva – Internos x Terceiros")
-
-col_i, col_t = st.columns(2)
-
-for col, tipo in zip([col_i, col_t], ["Interno", "Terceiro"]):
-    base = funcionarios_filtro[funcionarios_filtro["tipo"] == tipo]
-
-    with col:
-        st.subheader(tipo)
-        st.metric("Funcionários", base["email"].nunique())
-        st.metric("Aprovados (%)", round(
-            (base["status"] == "Aprovado").mean() * 100, 1))
-        st.metric("Reprovados (%)", round(
-            (base["status"] == "Reprovado").mean() * 100, 1))
-
-# =====================================================
-# Visão por Gerente (Interno x Terceiro)
+# Visão por GERENTE (formato FINAL)
 # =====================================================
 st.header("👔 Resultado por Gerente")
 
 gerentes = (
     funcionarios_filtro
-    .groupby(["manager_name", "tipo"], as_index=False)
+    .groupby("manager_name", as_index=False)
     .agg(
-        aprovados=("status", lambda x: (x == "Aprovado").sum()),
-        reprovados=("status", lambda x: (x == "Reprovado").sum())
+        aprovado_interno=("status", lambda x: ((funcionarios_filtro.loc[x.index, "tipo"] == "Interno") & (x == "Aprovado")).sum()),
+        reprovado_interno=("status", lambda x: ((funcionarios_filtro.loc[x.index, "tipo"] == "Interno") & (x == "Reprovado")).sum()),
+        aprovado_externo=("status", lambda x: ((funcionarios_filtro.loc[x.index, "tipo"] == "Externo") & (x == "Aprovado")).sum()),
+        reprovado_externo=("status", lambda x: ((funcionarios_filtro.loc[x.index, "tipo"] == "Externo") & (x == "Reprovado")).sum())
     )
 )
 
-st.dataframe(gerentes, width='stretch')
+gerentes["percentual_aprovados"] = (
+    (
+        gerentes["aprovado_interno"] + gerentes["aprovado_externo"]
+    ) /
+    (
+        gerentes[
+            ["aprovado_interno", "reprovado_interno",
+             "aprovado_externo", "reprovado_externo"]
+        ].sum(axis=1)
+    ) * 100
+).round(2)
 
 # =====================================================
-# Funcionários Não Aprovados + Exportação
+# Exibição com barra de progresso
+# =====================================================
+st.dataframe(
+    gerentes,
+    column_config={
+        "percentual_aprovados": st.column_config.ProgressColumn(
+            "Percentual de Aprovados",
+            min_value=0,
+            max_value=100,
+            format="%.2f%%"
+        )
+    }
+)
+
+# =====================================================
+# Funcionários Reprovados + Exportação
 # =====================================================
 st.header("❌ Funcionários Não Aprovados (< 80%)")
 
@@ -260,7 +243,7 @@ export_df = (
     .sort_values("percentual")
 )
 
-st.dataframe(export_df, width='stretch')
+st.dataframe(export_df)
 
 csv = export_df.to_csv(index=False, sep=";", encoding="utf-8-sig")
 
@@ -272,7 +255,7 @@ st.download_button(
 )
 
 # =====================================================
-# Gráfico Executivo Consolidado
+# Gráfico Executivo
 # =====================================================
 st.header("📊 Gráfico Executivo Consolidado")
 
