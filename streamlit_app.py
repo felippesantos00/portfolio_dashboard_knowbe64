@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 import glob
 import os
-import duckdb
 
 # =====================================================
 # Configuração da página
@@ -27,16 +26,34 @@ def normalizar_colunas(df):
     return df
 
 
+def normalizar_texto(col):
+    return col.astype(str).str.strip().str.lower()
+
+
+def formatar_nome(col):
+    return col.astype(str).str.strip().str.title()
+
+
 def carregar_arquivo_local(caminho):
-    if caminho.endswith(".csv"):
-        return pd.read_csv(caminho, sep=";", encoding="utf-8", on_bad_lines="skip")
-    return pd.read_excel(caminho)
+    try:
+        if caminho.endswith(".csv"):
+            return pd.read_csv(caminho, sep=";", encoding="utf-8", on_bad_lines="skip")
+        elif caminho.endswith(".xlsx"):
+            return pd.read_excel(caminho)
+    except Exception as e:
+        st.error(f"Erro ao carregar {os.path.basename(caminho)}: {e}")
+        return None
 
 
 def carregar_arquivo_upload(file):
-    if file.name.endswith(".csv"):
-        return pd.read_csv(file, sep=";", encoding="utf-8", on_bad_lines="skip")
-    return pd.read_excel(file)
+    try:
+        if file.name.endswith(".csv"):
+            return pd.read_csv(file, sep=";", encoding="utf-8", on_bad_lines="skip")
+        elif file.name.endswith(".xlsx"):
+            return pd.read_excel(file)
+    except Exception as e:
+        st.error(f"Erro ao carregar {file.name}: {e}")
+        return None
 
 
 # =====================================================
@@ -77,28 +94,25 @@ else:
     file = next(f for f in uploaded_files if f.name == arquivo_selecionado)
     df = carregar_arquivo_upload(file)
 
+if df is None:
+    st.stop()
+
 df = normalizar_colunas(df)
 
 # =====================================================
-# Normalização em PYTHON (não no DuckDB)
+# Normalização dos dados
 # =====================================================
-df["email"] = df["email"].astype(str).str.strip().str.lower()
+df["email"] = normalizar_texto(df["email"])
 
-# Nome do funcionário
 if {"first_name", "last_name"}.issubset(df.columns):
-    df["nome_funcionario"] = (
-        df["first_name"].fillna("") + " " + df["last_name"].fillna("")
-    ).str.strip().str.title()
+    df["nome_funcionario"] = formatar_nome(df["first_name"] + " " + df["last_name"])
 else:
     df["nome_funcionario"] = (
-        df["email"]
-        .str.split("@").str[0]
-        .str.replace(".", " ")
-        .str.title()
+        df["email"].str.split("@").str[0].str.replace(".", " ").str.title()
     )
 
-df["manager_name"] = df["manager_name"].astype(str).str.strip().str.title()
-df["department"] = df["department"].astype(str).str.strip().str.title()
+df["manager_name"] = formatar_nome(df["manager_name"])
+df["department"] = formatar_nome(df["department"])
 
 # Tipo de vínculo
 df["tipo"] = df["email"].apply(
@@ -116,32 +130,26 @@ df["concluido"] = (
 )
 
 # =====================================================
-# DuckDB
+# Consolidação por FUNCIONÁRIO (regra dos 80%)
 # =====================================================
-con = duckdb.connect(database=":memory:")
-con.register("treinamentos", df)
+funcionarios = (
+    df.groupby(
+        ["email", "nome_funcionario", "manager_name", "department", "tipo"],
+        as_index=False
+    )
+    .agg(
+        total_treinamentos=("concluido", "count"),
+        concluidos=("concluido", "sum")
+    )
+)
 
-# =====================================================
-# Consolidação por FUNCIONÁRIO (80%)
-# =====================================================
-funcionarios = con.execute("""
-SELECT
-    email,
-    nome_funcionario,
-    manager_name,
-    department,
-    tipo,
-    COUNT(*) AS total_treinamentos,
-    SUM(concluido) AS concluidos,
-    ROUND(100.0 * SUM(concluido) / COUNT(*), 2) AS percentual,
-    CASE
-        WHEN 100.0 * SUM(concluido) / COUNT(*) >= 80 THEN 'Aprovado'
-        ELSE 'Reprovado'
-    END AS status
-FROM treinamentos
-GROUP BY
-    email, nome_funcionario, manager_name, department, tipo
-""").df()
+funcionarios["percentual"] = (
+    funcionarios["concluidos"] / funcionarios["total_treinamentos"] * 100
+).round(2)
+
+funcionarios["status"] = funcionarios["percentual"].apply(
+    lambda x: "Aprovado" if x >= 80 else "Reprovado"
+)
 
 # =====================================================
 # Filtros
@@ -158,35 +166,36 @@ funcionarios_filtro = funcionarios[
     funcionarios["tipo"].isin(tipo_selecionado)
 ]
 
-con.register("funcionarios", funcionarios_filtro)
-
 # =====================================================
-# Visão por GERENTE (FINAL)
+# Visão por GERENTE (formato FINAL)
 # =====================================================
 st.header("👔 Resultado por Gerente")
 
-gerentes = con.execute("""
-SELECT
-    manager_name,
+gerentes = (
+    funcionarios_filtro
+    .groupby("manager_name", as_index=False)
+    .agg(
+        aprovado_interno=("status", lambda x: ((funcionarios_filtro.loc[x.index, "tipo"] == "Interno") & (x == "Aprovado")).sum()),
+        reprovado_interno=("status", lambda x: ((funcionarios_filtro.loc[x.index, "tipo"] == "Interno") & (x == "Reprovado")).sum()),
+        aprovado_externo=("status", lambda x: ((funcionarios_filtro.loc[x.index, "tipo"] == "Externo") & (x == "Aprovado")).sum()),
+        reprovado_externo=("status", lambda x: ((funcionarios_filtro.loc[x.index, "tipo"] == "Externo") & (x == "Reprovado")).sum())
+    )
+)
 
-    SUM(CASE WHEN tipo='Interno' AND status='Aprovado' THEN 1 ELSE 0 END) AS aprovado_interno,
-    SUM(CASE WHEN tipo='Interno' AND status='Reprovado' THEN 1 ELSE 0 END) AS reprovado_interno,
-
-    SUM(CASE WHEN tipo='Externo' AND status='Aprovado' THEN 1 ELSE 0 END) AS aprovado_externo,
-    SUM(CASE WHEN tipo='Externo' AND status='Reprovado' THEN 1 ELSE 0 END) AS reprovado_externo,
-
- ROUND(
-    SUM(CASE WHEN status='Aprovado' THEN 1 ELSE 0 END) * 100.0
-    / COUNT(*),
-    2
-) AS percentual_aprovados
-FROM funcionarios
-GROUP BY manager_name
-ORDER BY manager_name
-""").df()
+gerentes["percentual_aprovados"] = (
+    (
+        gerentes["aprovado_interno"] + gerentes["aprovado_externo"]
+    ) /
+    (
+        gerentes[
+            ["aprovado_interno", "reprovado_interno",
+             "aprovado_externo", "reprovado_externo"]
+        ].sum(axis=1)
+    ) * 100
+).round(2)
 
 # =====================================================
-# Tabela com barra de progresso
+# Exibição com barra de progresso
 # =====================================================
 st.dataframe(
     gerentes,
@@ -201,12 +210,48 @@ st.dataframe(
 )
 
 # =====================================================
-# Funcionários Reprovados
+# Funcionários Reprovados + Exportação
 # =====================================================
 st.header("❌ Funcionários Não Aprovados (< 80%)")
 
-st.dataframe(
-    funcionarios_filtro[funcionarios_filtro["status"] == "Reprovado"]
+lista_gerentes = sorted(funcionarios_filtro["manager_name"].unique())
+
+gerentes_selecionados = st.multiselect(
+    "Filtrar por gerente:",
+    options=lista_gerentes,
+    default=lista_gerentes
+)
+
+reprovados = funcionarios_filtro[
+    (funcionarios_filtro["status"] == "Reprovado") &
+    (funcionarios_filtro["manager_name"].isin(gerentes_selecionados))
+]
+
+export_df = (
+    reprovados[
+        [
+            "nome_funcionario",
+            "email",
+            "manager_name",
+            "department",
+            "tipo",
+            "total_treinamentos",
+            "concluidos",
+            "percentual"
+        ]
+    ]
+    .sort_values("percentual")
+)
+
+st.dataframe(export_df)
+
+csv = export_df.to_csv(index=False, sep=";", encoding="utf-8-sig")
+
+st.download_button(
+    label="⬇️ Baixar CSV – Funcionários Não Aprovados",
+    data=csv,
+    file_name="funcionarios_nao_aprovados.csv",
+    mime="text/csv"
 )
 
 # =====================================================
