@@ -72,18 +72,20 @@ arquivos_locais = glob.glob("input/*.csv") + glob.glob("input/*.xlsx")
 opcoes = []
 if arquivos_locais:
     opcoes.extend([("Local", arq) for arq in arquivos_locais])
-if uploaded_files:
+if uploaded_files is not None:
     opcoes.extend([("Upload", file.name) for file in uploaded_files])
 
 if not opcoes:
     st.warning("Nenhum arquivo disponível.")
     st.stop()
 
-origem, arquivo_selecionado = st.sidebar.selectbox(
+selecionado = st.sidebar.selectbox(
     "Selecione o arquivo:",
     options=opcoes,
     format_func=lambda x: f"{x[0]} • {os.path.basename(x[1])}"
 )
+
+origem, arquivo_selecionado = selecionado
 
 # =====================================================
 # Leitura do arquivo
@@ -91,8 +93,8 @@ origem, arquivo_selecionado = st.sidebar.selectbox(
 if origem == "Local":
     df = carregar_arquivo_local(arquivo_selecionado)
 else:
-    file = next(f for f in uploaded_files if f.name == arquivo_selecionado)
-    df = carregar_arquivo_upload(file)
+    file = next((f for f in uploaded_files if f.name == arquivo_selecionado), None)
+    df = carregar_arquivo_upload(file) if file else None
 
 if df is None:
     st.stop()
@@ -114,12 +116,10 @@ else:
 df["manager_name"] = formatar_nome(df["manager_name"])
 df["department"] = formatar_nome(df["department"])
 
-# Tipo de vínculo
 df["tipo"] = df["email"].apply(
     lambda x: "Externo" if x.startswith("extern") else "Interno"
 )
 
-# Conclusão
 df["concluido"] = (
     df["training_status"]
     .astype(str)
@@ -130,7 +130,7 @@ df["concluido"] = (
 )
 
 # =====================================================
-# Consolidação por FUNCIONÁRIO (regra dos 80%)
+# Consolidação por FUNCIONÁRIO
 # =====================================================
 funcionarios = (
     df.groupby(
@@ -167,7 +167,47 @@ funcionarios_filtro = funcionarios[
 ]
 
 # =====================================================
-# Visão por GERENTE (formato FINAL)
+# VISÃO GERAL (CORRIGIDA)
+# =====================================================
+st.header("📈 Visão Geral dos Treinamentos")
+
+base = funcionarios_filtro.copy()
+
+resumo = (
+    base
+    .groupby(["tipo", "status"])
+    .size()
+    .unstack(fill_value=0)
+)
+
+aprovados_internos = resumo.loc["Interno", "Aprovado"] if "Interno" in resumo.index else 0
+reprovados_internos = resumo.loc["Interno", "Reprovado"] if "Interno" in resumo.index else 0
+
+aprovados_externos = resumo.loc["Externo", "Aprovado"] if "Externo" in resumo.index else 0
+reprovados_externos = resumo.loc["Externo", "Reprovado"] if "Externo" in resumo.index else 0
+
+total_aprovados = aprovados_internos + aprovados_externos
+total_reprovados = reprovados_internos + reprovados_externos
+total_funcionarios = total_aprovados + total_reprovados
+
+percentual_aprovados = (
+    round((total_aprovados / total_funcionarios) * 100, 2)
+    if total_funcionarios > 0 else 0
+)
+
+col1, col2, col3, col4 = st.columns(4)
+
+col1.metric("👥 Total Funcionários", total_funcionarios)
+col2.metric("✅ Aprovados", total_aprovados)
+col3.metric("❌ Reprovados", total_reprovados)
+col4.metric(
+    "📊 % Aprovação",
+    f"{percentual_aprovados:.2f}%",
+    delta="Meta ≥ 80%" if percentual_aprovados >= 80 else "Abaixo da Meta"
+)
+
+# =====================================================
+# Visão por GERENTE
 # =====================================================
 st.header("👔 Resultado por Gerente")
 
@@ -194,9 +234,6 @@ gerentes["percentual_aprovados"] = (
     ) * 100
 ).round(2)
 
-# =====================================================
-# Exibição com barra de progresso
-# =====================================================
 st.dataframe(
     gerentes,
     column_config={
@@ -210,7 +247,7 @@ st.dataframe(
 )
 
 # =====================================================
-# Funcionários Reprovados + Exportação
+# Funcionários Reprovados
 # =====================================================
 st.header("❌ Funcionários Não Aprovados (< 80%)")
 
