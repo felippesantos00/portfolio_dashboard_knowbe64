@@ -1,8 +1,8 @@
 import streamlit as st
-import duckdb
 import pandas as pd
 import glob
 import os
+import duckdb
 
 # =====================================================
 # Configuração da página
@@ -15,63 +15,116 @@ st.set_page_config(
 st.title("📊 Dashboard Executivo de Treinamentos")
 
 # =====================================================
-# Sidebar – Fonte de dados
+# Funções utilitárias
+# =====================================================
+def normalizar_colunas(df):
+    df.columns = (
+        df.columns.str.strip()
+        .str.lower()
+        .str.replace(" ", "_")
+        .str.replace("?", "", regex=False)
+    )
+    return df
+
+
+def carregar_arquivo_local(caminho):
+    if caminho.endswith(".csv"):
+        return pd.read_csv(caminho, sep=";", encoding="utf-8", on_bad_lines="skip")
+    return pd.read_excel(caminho)
+
+
+def carregar_arquivo_upload(file):
+    if file.name.endswith(".csv"):
+        return pd.read_csv(file, sep=";", encoding="utf-8", on_bad_lines="skip")
+    return pd.read_excel(file)
+
+
+# =====================================================
+# Menu lateral – Fonte de dados
 # =====================================================
 st.sidebar.header("📂 Fonte de Dados")
 
-arquivos = glob.glob("input/*.csv")
+uploaded_files = st.sidebar.file_uploader(
+    "Upload de CSV ou Excel",
+    type=["csv", "xlsx"],
+    accept_multiple_files=True
+)
 
-if not arquivos:
-    st.warning("Nenhum arquivo CSV encontrado na pasta input/")
+arquivos_locais = glob.glob("input/*.csv") + glob.glob("input/*.xlsx")
+
+opcoes = []
+if arquivos_locais:
+    opcoes.extend([("Local", arq) for arq in arquivos_locais])
+if uploaded_files:
+    opcoes.extend([("Upload", file.name) for file in uploaded_files])
+
+if not opcoes:
+    st.warning("Nenhum arquivo disponível.")
     st.stop()
 
-arquivo_csv = st.sidebar.selectbox(
-    "Selecione o arquivo CSV",
-    arquivos,
-    format_func=lambda x: os.path.basename(x)
+origem, arquivo_selecionado = st.sidebar.selectbox(
+    "Selecione o arquivo:",
+    options=opcoes,
+    format_func=lambda x: f"{x[0]} • {os.path.basename(x[1])}"
 )
 
 # =====================================================
-# Conexão DuckDB (sem carregar tudo em memória)
+# Leitura do arquivo
+# =====================================================
+if origem == "Local":
+    df = carregar_arquivo_local(arquivo_selecionado)
+else:
+    file = next(f for f in uploaded_files if f.name == arquivo_selecionado)
+    df = carregar_arquivo_upload(file)
+
+df = normalizar_colunas(df)
+
+# =====================================================
+# Normalização em PYTHON (não no DuckDB)
+# =====================================================
+df["email"] = df["email"].astype(str).str.strip().str.lower()
+
+# Nome do funcionário
+if {"first_name", "last_name"}.issubset(df.columns):
+    df["nome_funcionario"] = (
+        df["first_name"].fillna("") + " " + df["last_name"].fillna("")
+    ).str.strip().str.title()
+else:
+    df["nome_funcionario"] = (
+        df["email"]
+        .str.split("@").str[0]
+        .str.replace(".", " ")
+        .str.title()
+    )
+
+df["manager_name"] = df["manager_name"].astype(str).str.strip().str.title()
+df["department"] = df["department"].astype(str).str.strip().str.title()
+
+# Tipo de vínculo
+df["tipo"] = df["email"].apply(
+    lambda x: "Externo" if x.startswith("extern") else "Interno"
+)
+
+# Conclusão
+df["concluido"] = (
+    df["training_status"]
+    .astype(str)
+    .str.strip()
+    .str.lower()
+    .eq("completed")
+    .astype(int)
+)
+
+# =====================================================
+# DuckDB
 # =====================================================
 con = duckdb.connect(database=":memory:")
+con.register("treinamentos", df)
 
 # =====================================================
-# View base (normalização já no SQL)
+# Consolidação por FUNCIONÁRIO (80%)
 # =====================================================
-con.execute(f"""
-CREATE OR REPLACE VIEW treinamentos AS
-SELECT
-    LOWER(TRIM(email)) AS email,
-
-    INITCAP(
-        COALESCE(
-            TRIM(first_name || ' ' || last_name),
-            REPLACE(SPLIT_PART(email, '@', 1), '.', ' ')
-        )
-    ) AS nome_funcionario,
-
-    INITCAP(TRIM(manager_name)) AS manager_name,
-    INITCAP(TRIM(department)) AS department,
-
-    CASE
-        WHEN LOWER(email) LIKE 'extern%' THEN 'Externo'
-        ELSE 'Interno'
-    END AS tipo,
-
-    CASE
-        WHEN LOWER(TRIM(training_status)) = 'completed' THEN 1
-        ELSE 0
-    END AS concluido
-
-FROM read_csv_auto('{arquivo_csv}', delim=';')
-""")
-
-# =====================================================
-# Consolidação por FUNCIONÁRIO (regra 80%)
-# =====================================================
-con.execute("""
-CREATE OR REPLACE VIEW funcionarios AS
+funcionarios = con.execute("""
 SELECT
     email,
     nome_funcionario,
@@ -80,62 +133,61 @@ SELECT
     tipo,
     COUNT(*) AS total_treinamentos,
     SUM(concluido) AS concluidos,
-    ROUND(SUM(concluido) * 100.0 / COUNT(*), 2) AS percentual,
+    ROUND(100.0 * SUM(concluido) / COUNT(*), 2) AS percentual,
     CASE
-        WHEN SUM(concluido) * 1.0 / COUNT(*) >= 0.8 THEN 'Aprovado'
+        WHEN 100.0 * SUM(concluido) / COUNT(*) >= 80 THEN 'Aprovado'
         ELSE 'Reprovado'
     END AS status
 FROM treinamentos
 GROUP BY
     email, nome_funcionario, manager_name, department, tipo
-""")
+""").df()
 
 # =====================================================
-# Filtro por tipo
+# Filtros
 # =====================================================
 st.sidebar.header("🔎 Filtros")
 
-tipos = st.sidebar.multiselect(
-    "Tipo de vínculo",
+tipo_selecionado = st.sidebar.multiselect(
+    "Tipo de vínculo:",
     ["Interno", "Externo"],
     default=["Interno", "Externo"]
 )
 
-tipos_sql = ",".join([f"'{t}'" for t in tipos])
+funcionarios_filtro = funcionarios[
+    funcionarios["tipo"].isin(tipo_selecionado)
+]
+
+con.register("funcionarios", funcionarios_filtro)
 
 # =====================================================
-# Visão FINAL por GERENTE
-# =====================================================
-query_gerentes = f"""
-SELECT
-    manager_name,
-
-    SUM(CASE WHEN tipo = 'Interno' AND status = 'Aprovado' THEN 1 ELSE 0 END) AS aprovado_interno,
-    SUM(CASE WHEN tipo = 'Interno' AND status = 'Reprovado' THEN 1 ELSE 0 END) AS reprovado_interno,
-
-    SUM(CASE WHEN tipo = 'Externo' AND status = 'Aprovado' THEN 1 ELSE 0 END) AS aprovado_externo,
-    SUM(CASE WHEN tipo = 'Externo' AND status = 'Reprovado' THEN 1 ELSE 0 END) AS reprovado_externo,
-
-    ROUND(
-        SUM(CASE WHEN status = 'Aprovado' THEN 1 ELSE 0 END) * 100.0
-        /
-        COUNT(*),
-        2
-    ) AS percentual_aprovados
-
-FROM funcionarios
-WHERE tipo IN ({tipos_sql})
-GROUP BY manager_name
-ORDER BY percentual_aprovados DESC
-"""
-
-gerentes = con.execute(query_gerentes).df()
-
-# =====================================================
-# Exibição – Gerentes
+# Visão por GERENTE (FINAL)
 # =====================================================
 st.header("👔 Resultado por Gerente")
 
+gerentes = con.execute("""
+SELECT
+    manager_name,
+
+    SUM(CASE WHEN tipo='Interno' AND status='Aprovado' THEN 1 ELSE 0 END) AS aprovado_interno,
+    SUM(CASE WHEN tipo='Interno' AND status='Reprovado' THEN 1 ELSE 0 END) AS reprovado_interno,
+
+    SUM(CASE WHEN tipo='Externo' AND status='Aprovado' THEN 1 ELSE 0 END) AS aprovado_externo,
+    SUM(CASE WHEN tipo='Externo' AND status='Reprovado' THEN 1 ELSE 0 END) AS reprovado_externo,
+
+ ROUND(
+    SUM(CASE WHEN status='Aprovado' THEN 1 ELSE 0 END) * 100.0
+    / COUNT(*),
+    2
+) AS percentual_aprovados
+FROM funcionarios
+GROUP BY manager_name
+ORDER BY manager_name
+""").df()
+
+# =====================================================
+# Tabela com barra de progresso
+# =====================================================
 st.dataframe(
     gerentes,
     column_config={
@@ -153,50 +205,8 @@ st.dataframe(
 # =====================================================
 st.header("❌ Funcionários Não Aprovados (< 80%)")
 
-lista_gerentes = sorted(gerentes["manager_name"].unique())
-
-gerentes_sel = st.multiselect(
-    "Filtrar por gerente",
-    lista_gerentes,
-    default=lista_gerentes
-)
-
-gerentes_sql = ",".join([f"'{g}'" for g in gerentes_sel])
-
-query_reprovados = f"""
-SELECT
-    nome_funcionario,
-    email,
-    manager_name,
-    department,
-    tipo,
-    total_treinamentos,
-    concluidos,
-    percentual
-FROM funcionarios
-WHERE status = 'Reprovado'
-  AND manager_name IN ({gerentes_sql})
-ORDER BY percentual
-"""
-
-reprovados = con.execute(query_reprovados).df()
-
 st.dataframe(
-    reprovados.style.format({
-        "percentual": "{:.2f}%"
-    })
-)
-
-# =====================================================
-# Exportação
-# =====================================================
-csv = reprovados.to_csv(index=False, sep=";", encoding="utf-8-sig")
-
-st.download_button(
-    "⬇️ Baixar CSV – Funcionários Não Aprovados",
-    csv,
-    "funcionarios_nao_aprovados.csv",
-    "text/csv"
+    funcionarios_filtro[funcionarios_filtro["status"] == "Reprovado"]
 )
 
 # =====================================================
@@ -204,17 +214,11 @@ st.download_button(
 # =====================================================
 st.header("📊 Gráfico Executivo Consolidado")
 
-grafico = con.execute(f"""
-SELECT tipo, status, COUNT(*) AS total
-FROM funcionarios
-WHERE tipo IN ({tipos_sql})
-GROUP BY tipo, status
-""").df()
+grafico = (
+    funcionarios_filtro
+    .groupby(["tipo", "status"])
+    .size()
+    .unstack(fill_value=0)
+)
 
-grafico_pivot = grafico.pivot(
-    index="tipo",
-    columns="status",
-    values="total"
-).fillna(0)
-
-st.bar_chart(grafico_pivot)
+st.bar_chart(grafico)
