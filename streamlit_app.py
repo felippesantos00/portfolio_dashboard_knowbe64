@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import glob
 import os
+import duckdb
 
 # =====================================================
 # Configuração da página
@@ -114,45 +115,45 @@ else:
 df["manager_name"] = formatar_nome(df["manager_name"])
 df["department"] = formatar_nome(df["department"])
 
-# Tipo de vínculo
-df["tipo"] = df["email"].apply(
-    lambda x: "Externo" if x.startswith("extern") else "Interno"
-)
-
-# Conclusão
-df["concluido"] = (
-    df["training_status"]
-    .astype(str)
-    .str.strip()
-    .str.lower()
-    .eq("completed")
-    .astype(int)
-)
+# =====================================================
+# DuckDB
+# =====================================================
+con = duckdb.connect(database=":memory:")
+con.register("treinamentos", df)
 
 # =====================================================
-# Consolidação por FUNCIONÁRIO (regra dos 80%)
+# Consolidação POR FUNCIONÁRIO (80%)
 # =====================================================
-funcionarios = (
-    df.groupby(
-        ["email", "nome_funcionario", "manager_name", "department", "tipo"],
-        as_index=False
-    )
-    .agg(
-        total_treinamentos=("concluido", "count"),
-        concluidos=("concluido", "sum")
-    )
-)
-
-funcionarios["percentual"] = (
-    funcionarios["concluidos"] / funcionarios["total_treinamentos"] * 100
-).round(2)
-
-funcionarios["status"] = funcionarios["percentual"].apply(
-    lambda x: "Aprovado" if x >= 80 else "Reprovado"
-)
+funcionarios = con.execute("""
+    SELECT
+        email,
+        nome_funcionario,
+        manager_name,
+        department,
+        CASE
+            WHEN LOWER(email) LIKE 'extern%' THEN 'Externo'
+            ELSE 'Interno'
+        END AS tipo,
+        COUNT(*) AS total_treinamentos,
+        SUM(CASE WHEN LOWER(training_status) = 'completed' THEN 1 ELSE 0 END) AS concluidos,
+        ROUND(
+            100.0 * SUM(CASE WHEN LOWER(training_status) = 'completed' THEN 1 ELSE 0 END) 
+            / COUNT(*),
+            2
+        ) AS percentual,
+        CASE
+            WHEN
+                100.0 * SUM(CASE WHEN LOWER(training_status) = 'completed' THEN 1 ELSE 0 END)
+                / COUNT(*) >= 80
+            THEN 'Aprovado'
+            ELSE 'Reprovado'
+        END AS status
+    FROM treinamentos
+    GROUP BY email, nome_funcionario, manager_name, department
+""").df()
 
 # =====================================================
-# Filtros
+# Filtros globais
 # =====================================================
 st.sidebar.header("🔎 Filtros")
 
@@ -166,39 +167,33 @@ funcionarios_filtro = funcionarios[
     funcionarios["tipo"].isin(tipo_selecionado)
 ]
 
+con.unregister("funcionarios")
+con.register("funcionarios", funcionarios_filtro)
+
 # =====================================================
-# Visão por GERENTE (formato FINAL)
+# Visão por GERENTE (FORMATO FINAL)
 # =====================================================
 st.header("👔 Resultado por Gerente")
 
-gerentes = (
-    funcionarios_filtro
-    .groupby("manager_name", as_index=False)
-    .agg(
-        aprovado_interno=("status", lambda x: ((funcionarios_filtro.loc[x.index, "tipo"] == "Interno") & (x == "Aprovado")).sum()),
-        reprovado_interno=("status", lambda x: ((funcionarios_filtro.loc[x.index, "tipo"] == "Interno") & (x == "Reprovado")).sum()),
-        aprovado_externo=("status", lambda x: ((funcionarios_filtro.loc[x.index, "tipo"] == "Externo") & (x == "Aprovado")).sum()),
-        reprovado_externo=("status", lambda x: ((funcionarios_filtro.loc[x.index, "tipo"] == "Externo") & (x == "Reprovado")).sum())
-    )
-)
+gerentes = con.execute("""
+    SELECT
+        manager_name,
+        SUM(CASE WHEN tipo = 'Interno' AND status = 'Aprovado' THEN 1 ELSE 0 END) AS aprovado_interno,
+        SUM(CASE WHEN tipo = 'Interno' AND status = 'Reprovado' THEN 1 ELSE 0 END) AS reprovado_interno,
+        SUM(CASE WHEN tipo = 'Externo' AND status = 'Aprovado' THEN 1 ELSE 0 END) AS aprovado_externo,
+        SUM(CASE WHEN tipo = 'Externo' AND status = 'Reprovado' THEN 1 ELSE 0 END) AS reprovado_externo,
+        ROUND(
+            100.0 * SUM(CASE WHEN status = 'Aprovado' THEN 1 ELSE 0 END) / COUNT(*),
+            2
+        ) AS percentual_aprovados
+    FROM funcionarios
+    GROUP BY manager_name
+    ORDER BY manager_name
+""").df()
 
-gerentes["percentual_aprovados"] = (
-    (
-        gerentes["aprovado_interno"] + gerentes["aprovado_externo"]
-    ) /
-    (
-        gerentes[
-            ["aprovado_interno", "reprovado_interno",
-             "aprovado_externo", "reprovado_externo"]
-        ].sum(axis=1)
-    ) * 100
-).round(2)
-
-# =====================================================
-# Exibição com barra de progresso
-# =====================================================
 st.dataframe(
     gerentes,
+    hide_index=True,
     column_config={
         "percentual_aprovados": st.column_config.ProgressColumn(
             "Percentual de Aprovados",
@@ -227,23 +222,20 @@ reprovados = funcionarios_filtro[
     (funcionarios_filtro["manager_name"].isin(gerentes_selecionados))
 ]
 
-export_df = (
-    reprovados[
-        [
-            "nome_funcionario",
-            "email",
-            "manager_name",
-            "department",
-            "tipo",
-            "total_treinamentos",
-            "concluidos",
-            "percentual"
-        ]
+export_df = reprovados[
+    [
+        "nome_funcionario",
+        "email",
+        "manager_name",
+        "department",
+        "tipo",
+        "total_treinamentos",
+        "concluidos",
+        "percentual"
     ]
-    .sort_values("percentual")
-)
+].sort_values("percentual")
 
-st.dataframe(export_df)
+st.dataframe(export_df, hide_index=True)
 
 csv = export_df.to_csv(index=False, sep=";", encoding="utf-8-sig")
 
@@ -255,7 +247,7 @@ st.download_button(
 )
 
 # =====================================================
-# Gráfico Executivo
+# Gráfico Executivo Consolidado
 # =====================================================
 st.header("📊 Gráfico Executivo Consolidado")
 
